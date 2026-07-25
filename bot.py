@@ -11,7 +11,7 @@ from pathlib import Path
 load_dotenv()
 
 USE_OLLAMA = True  
-OLLAMA_MODEL = "qwen3.5:2b"  
+OLLAMA_MODEL = "qwen3.5:9b"  
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -151,6 +151,7 @@ async def generate_reply_ollama(history):
     response = await asyncio.to_thread(
         ollama.chat,
         model=OLLAMA_MODEL,
+        think=False,
         messages=messages
     )
     return response['message']['content']

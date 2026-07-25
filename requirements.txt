@@ -1,0 +1,4 @@
+discord.py
+ollama
+python-dotenv
+google.generativeai
