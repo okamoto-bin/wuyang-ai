@@ -4,13 +4,14 @@ import google.generativeai as genai
 import asyncio
 import time
 import os
+import ollama  # 追加
 from dotenv import load_dotenv
 from pathlib import Path
+
 load_dotenv()
 
-# =====================
-# 🔐 環境変数
-# =====================
+USE_OLLAMA = True  
+OLLAMA_MODEL = "qwen3.5:2b"  
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,11 +19,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKENが未設定")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEYが未設定")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+# Geminiの初期化 (APIキーがある場合のみ)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 # =====================
 # Discord設定
@@ -44,14 +45,16 @@ def get_history(user_id):
 
 def add_history(user_id, role, content):
     h = get_history(user_id)
-    h.append({"role": role, "parts": [content]})
+    # Ollama用にrole名を統一 (Geminiの'model'はOllamaでは'assistant'に変換)
+    normalized_role = "assistant" if role == "model" else role
+    h.append({"role": normalized_role, "content": content})
     if len(h) > MAX_HISTORY:
         h.pop(0)
 
 # =====================
 # クールダウン
 # =====================
-COOLDOWN = 5
+COOLDOWN = 3  # ローカルLLMはレスポンスが早いため少し短めに調整
 last_used = {}
 
 def is_cooldown(user_id):
@@ -67,10 +70,8 @@ TRIGGERS = ["ウーヤン", "水", "流れ", "オーバーウォッチ", "ow", "
 
 def should_reply(message, content):
     keyword = any(t in content for t in TRIGGERS)
-
     mention = bot.user in message.mentions
 
-    # ロールメンション対応
     role_mention = False
     if message.guild and message.role_mentions:
         bot_role_ids = {r.id for r in message.guild.me.roles}
@@ -85,7 +86,7 @@ def should_reply(message, content):
     return keyword or mention or role_mention or reply
 
 # =====================
-# プロンプト（完全統合版）
+# プロンプト
 # =====================
 SYSTEM_PROMPT = """
 あなたはウーヤン。
@@ -118,7 +119,6 @@ SYSTEM_PROMPT = """
 ワイルドパワーだ！
 
 ■感情の扱い（重要）
-
 「しまった」「あちゃー」：失敗・ミス・がっかり → アイヤー
 「あらまあ」「わお」：驚き・予想外 → アイヤー
 「あーあ」：呆れ・残念 → アイヤー
@@ -138,6 +138,39 @@ SYSTEM_PROMPT = """
 ・メタ発言禁止
 ・キャラ崩壊禁止
 """
+
+# =====================
+# LLM呼び出し関数
+# =====================
+async def generate_reply_ollama(history):
+    """Ollamaを使用した推論 (非同期処理)"""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    
+    # asyncio.to_thread を使用してブロッキングを防止
+    response = await asyncio.to_thread(
+        ollama.chat,
+        model=OLLAMA_MODEL,
+        messages=messages
+    )
+    return response['message']['content']
+
+async def generate_reply_gemini(history):
+    """Gemini APIを使用したフォールバック推論"""
+    if not GEMINI_API_KEY:
+        raise ValueError("Gemini API Keyがありません")
+
+    # Geminiのメッセージフォーマットに変換
+    contents = [{"role": "user", "parts": [SYSTEM_PROMPT]}]
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [msg["content"]]})
+
+    response = await asyncio.to_thread(
+        gemini_model.generate_content,
+        contents
+    )
+    return response.text
 
 # =====================
 # 起動
@@ -170,37 +203,33 @@ async def on_message(message):
 
     try:
         async with message.channel.typing():
-
             add_history(user_id, "user", content)
             history = get_history(user_id)
 
-            contents = [{"role": "user", "parts": [SYSTEM_PROMPT]}]
-            contents.extend(history)
+            reply = None
 
-            response = await asyncio.to_thread(
-                model.generate_content,
-                contents
-            )
+            if USE_OLLAMA:
+                try:
+                    reply = await generate_reply_ollama(history)
+                except Exception as ollama_err:
+                    print(f"[Ollama Error] Geminiへ切り替えます: {ollama_err}")
 
-            reply = response.text
+            if reply is None:
+                reply = await generate_reply_gemini(history)
 
-            add_history(user_id, "model", reply)
+            add_history(user_id, "assistant", reply)
             set_cooldown(user_id)
 
             await message.reply(reply)
 
     except Exception as e:
         print("エラー:", e)
-
         text = str(e).lower()
 
-        # 429（混雑）
         if "429" in text or "quota" in text:
             await message.reply("今は水の流れが密集している。少し休めばまた道は開く。")
-            return
-
-        # その他エラー
-        await message.reply("流れが乱れたな。もう一度頼む。")
+        else:
+            await message.reply("流れが乱れたな。もう一度頼む。")
 
     await bot.process_commands(message)
 
